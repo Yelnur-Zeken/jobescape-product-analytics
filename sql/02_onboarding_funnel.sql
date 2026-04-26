@@ -1,48 +1,68 @@
 -- 02_onboarding_funnel.sql
--- Onboarding funnel: per-step user counts and step-to-step conversion.
--- Steps: app_open -> onboarding_start -> goal_selected -> level_selected
---        -> personalization_done -> paywall_view -> trial_start
+-- Acquisition funnel from first quiz path event to paid subscription.
+-- Steps:
+--   path_selected  -> email_submit  -> subscribe  -> registration_signup_click  -> upsell_view
+--
+-- Output: per-day step counts and step-to-step conversion rates,
+-- sliceable by funnel_version and geo (T1 / WW).
 
-DECLARE start_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY);
-DECLARE end_date   DATE DEFAULT CURRENT_DATE();
+-- ⚠️ COST SAFETY: 14-day default window. Do not extend without dry-run check.
+DECLARE start_ts TIMESTAMP DEFAULT TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 14 DAY);
+DECLARE end_ts   TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
 
-WITH onboarding AS (
+WITH funnel_events AS (
+  SELECT
+    user_id,
+    device_id,
+    event_name,
+    timestamp,
+    DATE(timestamp)                                   AS event_date,
+    country_code,
+    JSON_VALUE(event_metadata, '$.funnel_version')    AS funnel_version
+  FROM `events.funnel-raw-table`
+  WHERE event_name IN (
+          'pr_funnel_scale_path',
+          'pr_funnel_escape_path',
+          'pr_funnel_simplify_path',
+          'pr_funnel_starter_path',
+          'pr_funnel_email_submit',
+          'pr_funnel_subscribe'
+        )
+    AND country_code != 'KZ'
+    AND timestamp BETWEEN start_ts AND end_ts
+),
+
+webapp_events AS (
   SELECT
     user_id,
     event_name,
-    JSON_VALUE(event_metadata, '$.step_name') AS step_name,
-    timestamp
-  FROM `hopeful-list-429812-f3.events.app_raw_table`
+    timestamp,
+    DATE(timestamp) AS event_date
+  FROM `events.app-raw-table`
   WHERE event_name IN (
-    'app_open',
-    'onboarding_start',
-    'goal_selected',
-    'level_selected',
-    'personalization_done',
-    'paywall_view',
-    'trial_start'
-  )
-    AND DATE(timestamp) BETWEEN start_date AND end_date
-),
-
-per_step AS (
-  SELECT
-    COUNT(DISTINCT IF(event_name='app_open',             user_id, NULL)) AS s0_open,
-    COUNT(DISTINCT IF(event_name='onboarding_start',     user_id, NULL)) AS s1_start,
-    COUNT(DISTINCT IF(event_name='goal_selected',        user_id, NULL)) AS s2_goal,
-    COUNT(DISTINCT IF(event_name='level_selected',       user_id, NULL)) AS s3_level,
-    COUNT(DISTINCT IF(event_name='personalization_done', user_id, NULL)) AS s4_personalize,
-    COUNT(DISTINCT IF(event_name='paywall_view',         user_id, NULL)) AS s5_paywall,
-    COUNT(DISTINCT IF(event_name='trial_start',          user_id, NULL)) AS s6_trial
-  FROM onboarding
+          'pr_webapp_registration_signup_click',
+          'pr_webapp_upsell_view'
+        )
+    AND timestamp BETWEEN start_ts AND end_ts
 )
 
 SELECT
-  s0_open,
-  s1_start, SAFE_DIVIDE(s1_start, s0_open) AS cr_open_to_start,
-  s2_goal,  SAFE_DIVIDE(s2_goal,  s1_start) AS cr_start_to_goal,
-  s3_level, SAFE_DIVIDE(s3_level, s2_goal)  AS cr_goal_to_level,
-  s4_personalize, SAFE_DIVIDE(s4_personalize, s3_level)      AS cr_level_to_personalize,
-  s5_paywall,     SAFE_DIVIDE(s5_paywall,     s4_personalize) AS cr_personalize_to_paywall,
-  s6_trial,       SAFE_DIVIDE(s6_trial,       s5_paywall)     AS cr_paywall_to_trial
-FROM per_step;
+  COALESCE(f.event_date, w.event_date)                                       AS event_date,
+  ANY_VALUE(f.funnel_version)                                                AS funnel_version,
+  COUNT(DISTINCT IF(f.event_name LIKE 'pr_funnel_%_path', f.device_id, NULL)) AS s1_path_selected,
+  COUNT(DISTINCT IF(f.event_name = 'pr_funnel_email_submit',  f.user_id, NULL)) AS s2_email_submit,
+  COUNT(DISTINCT IF(f.event_name = 'pr_funnel_subscribe',     f.user_id, NULL)) AS s3_subscribe,
+  COUNT(DISTINCT IF(w.event_name = 'pr_webapp_registration_signup_click', w.user_id, NULL)) AS s4_signup,
+  COUNT(DISTINCT IF(w.event_name = 'pr_webapp_upsell_view',   w.user_id, NULL)) AS s5_upsell_view
+FROM funnel_events f
+FULL OUTER JOIN webapp_events w
+  ON f.user_id = w.user_id
+ AND f.event_date = w.event_date
+GROUP BY event_date
+ORDER BY event_date DESC;
+
+-- Adjacent step-to-step conversion (use this in Looker Studio with calculated fields):
+--   cr_path_to_email   = s2_email_submit / s1_path_selected
+--   cr_email_to_sub    = s3_subscribe    / s2_email_submit
+--   cr_sub_to_signup   = s4_signup       / s3_subscribe
+--   cr_signup_to_upsell= s5_upsell_view  / s4_signup

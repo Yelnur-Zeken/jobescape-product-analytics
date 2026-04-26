@@ -64,6 +64,16 @@ gcloud auth application-default login
 
 Open any notebook in JupyterLab and replace the `bigquery.Client(project=...)` call with your own GCP project if you fork this repo.
 
+## Cost safety
+
+This repo runs queries against a **production BigQuery warehouse**. To prevent accidental large scans:
+
+1. **All notebooks set `maximum_bytes_billed = 10 GB`** (1 GB for the A/B notebook). If a query would scan more than the cap, BigQuery returns an error **without charging**.
+2. **Default time windows are short** (7–14 days). Do not extend without first checking the dry-run estimate in the BigQuery Console.
+3. **All queries on `events.app-raw-table` use partition predicates** (`DATE(timestamp) BETWEEN ...` or `timestamp >= ...`). Do not remove these predicates — partition pruning is the difference between scanning a few GB and scanning the whole table.
+4. **Run SQL files one query at a time.** In the BigQuery Console, highlight a single SELECT/WITH statement and click **Run** — never run the whole file at once.
+5. **Always read the dry-run estimate** (top-right of the Query editor: "This query will process N MB / GB") **before clicking Run.** If estimate > 5 GB for a 14-day window — abort and narrow further.
+
 ## Disclaimer
 
 This repository contains analysis code and metric definitions only. No raw user data, payment data, or PII is committed.

@@ -1,65 +1,130 @@
 -- 04_upsell_by_segment.sql
--- Upsell performance for users acquired via new creatives + new acquisition funnel
--- vs the baseline. Uses attribution_id from events to join with facebook_ads (Fivetran).
+-- Upsell performance for users from new creatives + new acquisition funnel
+-- vs the baseline. Joins funnel events, webapp upsell events, and the
+-- payments.all_payments_prod cash table.
 --
--- Metrics:
---   * paying_users
---   * upsell_gain      = upsell_revenue / first_purchase_revenue
---   * arpu_90d         = sum(payment_amount within first 90 days) / paying_users
+-- Output:
+--   * exposed_users      — users who saw the upsell page
+--   * ttp_clicks         — users who clicked "purchase" on the upsell
+--   * paid_users         — users with a settled upsell payment
+--   * unsub_12h_users    — paid users who unsubscribed within 12h
+--   * upsell_revenue_usd — sum of settled upsell amounts (in USD)
+--   * upsell_gain        — upsell_revenue_usd / paid_users (avg revenue per paid upsell user)
+--   * cr_view_to_paid    — paid_users / exposed_users
+--
+-- ⚠️ COST SAFETY: This query has multiple LEFT JOINs to events.app-raw-table.
+-- The `start_ts` filter is applied to `fun.timestamp` AND `ups_view.timestamp`
+-- to enable partition pruning on both joined sides. Do NOT remove either.
+-- Run this ONLY with a narrow window (5-7 days). Always check dry-run estimate
+-- in the BigQuery Console before clicking Run.
+--
+-- Adjust `start_ts`, `upsell_versions` for your window.
 
-DECLARE start_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY);
-DECLARE end_date   DATE DEFAULT CURRENT_DATE();
+DECLARE start_ts TIMESTAMP DEFAULT TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY);
+DECLARE upsell_versions ARRAY<STRING> DEFAULT ['u15.4.0','u15.4.5'];
 
-WITH attributed_users AS (
-  SELECT DISTINCT
-    e.user_id,
-    e.attribution_id,
-    DATE(MIN(e.timestamp)) OVER (PARTITION BY e.user_id) AS install_date,
-    JSON_VALUE(e.user_metadata, '$.creative_group')      AS creative_group,
-    JSON_VALUE(e.user_metadata, '$.funnel_version')      AS funnel_version
-  FROM `hopeful-list-429812-f3.events.app_raw_table` e
-  WHERE e.event_name = 'app_install'
-    AND DATE(e.timestamp) BETWEEN start_date AND end_date
+WITH upsell_payments AS (
+  SELECT
+    customer_account_id,
+    rebill_count,
+    SUM(amount) / 100   AS upsell_amount_usd,
+    COUNT(*)            AS upsell_payment_count
+  FROM `payments.all_payments_prod`
+  WHERE TIMESTAMP_MICROS(created_at) >= start_ts
+    AND status        = 'settled'
+    AND payment_type  = 'upsell'
+    AND rebill_count IN (-14, -20, -22)
+  GROUP BY customer_account_id, rebill_count
 ),
 
-segmented AS (
+base AS (
   SELECT
-    user_id,
-    install_date,
+    fun.user_id,
+    fun.timestamp                                                         AS subscribe_ts,
+    JSON_VALUE(fun.event_metadata, '$.funnel_version')                    AS funnel_version,
     CASE
-      WHEN creative_group = 'new_creative_v2' AND funnel_version = 'funnel_v3'
-        THEN 'new_creative_new_funnel'
-      ELSE 'baseline'
-    END AS segment
-  FROM attributed_users
-),
-
-payments_window AS (
-  SELECT
-    p.user_id,
-    p.payment_id,
-    p.payment_amount_usd,
-    p.payment_type,                          -- 'first_purchase' | 'upsell' | 'renewal'
-    p.payment_date
-  FROM `hopeful-list-429812-f3.payments.payments` p
-  JOIN segmented s USING (user_id)
-  WHERE p.payment_date BETWEEN s.install_date
-                          AND DATE_ADD(s.install_date, INTERVAL 90 DAY)
+      WHEN JSON_VALUE(fun.event_metadata, '$.country_code') IN
+           ('AE','AT','AU','BH','BN','CA','CZ','DE','DK','ES','FI','FR',
+            'GB','HK','IE','IL','IT','JP','KR','NL','NO','PT','QA','SA',
+            'SE','SG','SI','US','NZ')
+      THEN 'T1' ELSE 'WW'
+    END                                                                   AS geo,
+    COALESCE(
+      JSON_VALUE(ups_view.event_metadata, '$.upsell_version'),
+      REGEXP_EXTRACT(ups_view.referrer, r'[?&]upsell_version=([^&]+)')
+    )                                                                     AS upsell_version,
+    JSON_VALUE(ups_view.event_metadata, '$.upsell_order')                 AS upsell_order,
+    ups_view.event_id                                                     AS upsell_view_id,
+    ups_ttp.event_id                                                      AS upsell_ttp_id,
+    ups_purch.event_id                                                    AS upsell_purch_id,
+    unsub.timestamp                                                       AS unsub_ts,
+    cash.upsell_amount_usd
+  FROM `events.funnel-raw-table` fun
+  LEFT JOIN `events.app-raw-table` ups_view
+    ON  ups_view.event_name = 'pr_webapp_upsell_view'
+    AND ups_view.user_id    = fun.user_id
+    AND ups_view.timestamp >= start_ts                                  -- partition prune
+    AND JSON_VALUE(ups_view.query_parameters, '$.source') = 'register'
+  LEFT JOIN `events.app-raw-table` ups_ttp
+    ON  ups_ttp.event_name  = 'pr_webapp_upsell_purchase_click'
+    AND ups_ttp.user_id     = fun.user_id
+    AND ups_ttp.timestamp >= start_ts                                   -- partition prune
+    AND JSON_VALUE(ups_ttp.query_parameters, '$.source') = 'register'
+    AND JSON_VALUE(ups_ttp.event_metadata,   '$.upsell_order') =
+        JSON_VALUE(ups_view.event_metadata, '$.upsell_order')
+  LEFT JOIN `events.app-raw-table` ups_purch
+    ON  ups_purch.event_name = 'pr_webapp_upsell_successful_purchase'
+    AND ups_purch.user_id    = fun.user_id
+    AND ups_purch.timestamp >= start_ts                                 -- partition prune
+    AND JSON_VALUE(ups_purch.query_parameters, '$.source') = 'register'
+    AND JSON_VALUE(ups_purch.event_metadata,   '$.upsell_order') =
+        JSON_VALUE(ups_view.event_metadata,   '$.upsell_order')
+  LEFT JOIN `events.app-raw-table` unsub
+    ON  unsub.event_name = 'pr_webapp_unsubscribed'
+    AND unsub.user_id    = fun.user_id
+    AND unsub.timestamp >= start_ts                                     -- partition prune
+  LEFT JOIN upsell_payments cash
+    ON  cash.customer_account_id = ups_purch.user_id
+    AND (
+      (JSON_VALUE(ups_view.event_metadata, '$.upsell_order') = '1' AND cash.rebill_count IN (-14)) OR
+      (JSON_VALUE(ups_view.event_metadata, '$.upsell_order') = '2' AND cash.rebill_count IN (-20, -22))
+    )
+  WHERE fun.event_name = 'pr_funnel_subscribe'
+    AND fun.country_code != 'KZ'
+    AND fun.timestamp >= start_ts
+    AND ups_view.timestamp >= start_ts
+    AND COALESCE(
+          JSON_VALUE(ups_view.event_metadata, '$.upsell_version'),
+          REGEXP_EXTRACT(ups_view.referrer, r'[?&]upsell_version=([^&]+)')
+        ) IN UNNEST(upsell_versions)
+    AND JSON_VALUE(fun.event_metadata, '$.card_type') NOT IN ('PREPAID')
+    AND JSON_VALUE(fun.event_metadata, '$.channel') = 'primer'
 )
 
 SELECT
-  s.segment,
-  COUNT(DISTINCT s.user_id)                                          AS users,
-  COUNT(DISTINCT p.user_id)                                          AS paying_users,
-  SAFE_DIVIDE(COUNT(DISTINCT p.user_id), COUNT(DISTINCT s.user_id))  AS conversion_rate,
-  SUM(IF(p.payment_type = 'first_purchase', p.payment_amount_usd, 0)) AS first_purchase_rev,
-  SUM(IF(p.payment_type = 'upsell',         p.payment_amount_usd, 0)) AS upsell_rev,
+  upsell_version,
+  funnel_version,
+  geo,
+  upsell_order,
+  COUNT(DISTINCT user_id)                                              AS subscribers,
+  COUNT(DISTINCT IF(upsell_view_id  IS NOT NULL, user_id, NULL))       AS exposed_users,
+  COUNT(DISTINCT IF(upsell_ttp_id   IS NOT NULL, user_id, NULL))       AS ttp_clicks,
+  COUNT(DISTINCT IF(upsell_purch_id IS NOT NULL, user_id, NULL))       AS paid_users,
+  COUNT(DISTINCT IF(
+    upsell_purch_id IS NOT NULL
+    AND unsub_ts IS NOT NULL
+    AND TIMESTAMP_DIFF(unsub_ts, subscribe_ts, HOUR) <= 12,
+    user_id, NULL
+  ))                                                                   AS unsub_12h_users,
+  SUM(IFNULL(upsell_amount_usd, 0))                                    AS upsell_revenue_usd,
   SAFE_DIVIDE(
-    SUM(IF(p.payment_type = 'upsell', p.payment_amount_usd, 0)),
-    SUM(IF(p.payment_type = 'first_purchase', p.payment_amount_usd, 0))
-  )                                                                  AS upsell_gain,
-  SAFE_DIVIDE(SUM(p.payment_amount_usd), COUNT(DISTINCT p.user_id))  AS arpu_90d
-FROM segmented s
-LEFT JOIN payments_window p USING (user_id)
-GROUP BY s.segment
-ORDER BY s.segment;
+    SUM(IFNULL(upsell_amount_usd, 0)),
+    COUNT(DISTINCT IF(upsell_purch_id IS NOT NULL, user_id, NULL))
+  )                                                                    AS upsell_gain,
+  SAFE_DIVIDE(
+    COUNT(DISTINCT IF(upsell_purch_id IS NOT NULL, user_id, NULL)),
+    COUNT(DISTINCT IF(upsell_view_id  IS NOT NULL, user_id, NULL))
+  )                                                                    AS cr_view_to_paid
+FROM base
+GROUP BY upsell_version, funnel_version, geo, upsell_order
+ORDER BY upsell_version, funnel_version, geo, upsell_order;
