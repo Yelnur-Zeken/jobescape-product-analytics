@@ -1,54 +1,149 @@
 # Data Dictionary
 
-Canonical metric definitions used in this internship work. These should be the single source of truth — if a stakeholder uses a different definition, refer them here first.
+Canonical metric and entity definitions used in this internship work.
+These should be the single source of truth — if a stakeholder uses a
+different definition, refer them here first.
+
+## Source tables
+
+| Table | Description | Partition |
+|---|---|---|
+| `` `events.funnel-raw-table` `` | Pre-signup quiz / acquisition events with prefix `pr_funnel_*` | `DATE(timestamp)` |
+| `` `events.app-raw-table` `` | Post-signup webapp events with prefix `pr_webapp_*` | `DATE(timestamp)` |
+| `` `payments.all_payments_prod` `` | Unified Adyen + Airwallex payments. `amount` in cents, `created_at` in microseconds | — |
+| `` `analytics_draft.intercom_tickets` `` | Intercom conversations enriched with tags | — |
+| `ab_tests.ab_tests` | Long-format experiment metric values | — |
+
+Both `events.*` tables share the same column model: `event_id`, `user_id`,
+`device_id`, `event_name`, `timestamp`, `country_code`, `ip`,
+`user_agent`, `referrer`, `attribution_id`, plus three JSON columns
+`event_metadata`, `query_parameters`, `user_metadata`.
 
 ## User-level entities
 
 | Field | Source | Notes |
 |---|---|---|
-| `user_id` | `events.app_raw_table.user_id` | Primary user identifier. Stable across sessions and devices once authenticated. |
-| `device_id` | `events.app_raw_table.device_id` | Device-level identifier. Pre-auth users are keyed on this. |
-| `attribution_id` | `events.app_raw_table.attribution_id` | Joins to ad-platform attribution. |
-| `install_date` | `MIN(timestamp)` where `event_name = 'app_install'` | One row per `user_id`. |
+| `user_id` | `events.*-raw-table.user_id` | Primary user identifier. Stable across sessions and devices once authenticated. |
+| `device_id` | `events.*-raw-table.device_id` | Device-level identifier. Pre-auth users are keyed on this. |
+| `attribution_id` | `events.*-raw-table.attribution_id` | Joins to ad-platform attribution. |
+| `purch_date` | `DATE(MIN(timestamp))` where `event_name = 'pr_funnel_subscribe'` | Cohort entry day. |
 
-## Activity definitions
+## Geo bucketing
 
-- **Active user (DAU/WAU/MAU)** — distinct `user_id` with at least one event of any name in the window.
-- **Session** — series of events from the same `user_id` separated by less than 30 minutes of inactivity.
+```sql
+CASE
+  WHEN country_code IN ('AE','AT','AU','BH','BN','CA','CZ','DE','DK','ES',
+                        'FI','FR','GB','HK','IE','IL','IT','JP','KR','NL',
+                        'NO','PT','QA','SA','SE','SG','SI','US','NZ') THEN 'T1'
+  ELSE 'WW'
+END AS geo
+```
 
 ## Retention
 
-- **Retention D_n** — share of cohort users with at least one event on `install_date + n days`. Cohorts are bucketed by `install_date`. We track D1, D3, D5, D7.
+Two parallel definitions are computed and reported separately. A user
+is "retained on day N" if at least one of the events listed below fires
+on `purch_date + N days`. Day N is bucketed via
+`TIMESTAMP_DIFF(ret_timestamp, purch_timestamp, MINUTE)` in 1440-minute
+steps up to Day 30, with a `> 30` overflow bucket.
 
-## Onboarding funnel
+- **Lessons-retention** — events
+  `pr_webapp_lesson_started`, `pr_webapp_lesson_completed`,
+  `pr_webapp_lesson_csat_click`, `pr_webapp_course_csat_click`
+- **AI-Tools-retention** — events
+  `pr_webapp_ai_chat_message_sent`, `pr_webapp_ai_chat_message_received`,
+  `pr_webapp_ai_assistant_generate_click`,
+  `pr_webapp_ai_assistant_message_received`
 
-The canonical step order:
+Cohort start is `pr_funnel_subscribe` (the moment a user starts a paid
+trial), filtered for `country_code != 'KZ'` and emails not matching
+`%test%`.
+
+## Upsell flow
+
+The upsell flow is shown immediately after
+`pr_webapp_registration_signup_click` and tracked through three webapp
+events:
+
+1. `pr_webapp_upsell_view`            — offer shown
+2. `pr_webapp_upsell_purchase_click`  — TTP click
+3. `pr_webapp_upsell_successful_purchase` — successful purchase event
+
+The actual cash settlement is recorded in `payments.all_payments_prod`
+with:
 
 ```
-app_open -> onboarding_start -> goal_selected -> level_selected -> personalization_done -> paywall_view -> trial_start
+payment_type = 'upsell'
+status       = 'settled'
+rebill_count IN (-14, -20, -22)
 ```
 
-- **Onboarding Completion Rate** — share of `app_open` users that reach `personalization_done` within 24 hours.
+where `rebill_count = -14` corresponds to `upsell_order = '1'` and
+`rebill_count IN (-20, -22)` corresponds to `upsell_order = '2'`.
 
-## Engagement
+### Upsell metrics
 
-- **AI Chat / Workflow Start Rate (D0..D7)** — share of cohort users who fired any of `ai_chat_start`, `ai_assistant_start`, `ai_workflow_start` within the given window since install.
-- **First Lesson Completion Rate (all time)** — share of users who fired `lesson_complete` at least once.
-- **3 Lessons Completion Rate** — share of users who fired `lesson_complete` at least three times.
-- **Median Learning Session Time** — `APPROX_QUANTILES(session_minutes, 100)[50]` over learning sessions.
+- **Upsell View Count** — count of `pr_webapp_upsell_view` events on the
+  cohort.
+- **Upsell TTP Rate (on View)** — share of viewers that fired
+  `pr_webapp_upsell_purchase_click`.
+- **Upsell SR (on TTP)** — share of TTP-clickers that fired
+  `pr_webapp_upsell_successful_purchase`.
+- **Upsell Rate (on View)** — share of viewers that ultimately purchased.
+- **Upsell Gain (on View)** — `SUM(upsell purch_amount) / COUNT(viewers)`.
+- **AOV (on Purchasing Users)** — average `purch_amount` among users
+  with at least one settled upsell payment.
 
-## Monetization
+## Funnel
 
-- **Trial start** — `event_name = 'trial_start'` in events table.
-- **First purchase / Upsell / Renewal** — categorized by `payment_type` in the `payments` table.
-- **Upsell Gain** — `sum(upsell revenue) / sum(first_purchase revenue)`.
-- **ARPU 90d** — `sum(payment amount within 90 days of install) / paying_users`.
+```
+pr_funnel_*_path -> pr_funnel_email_submit -> pr_funnel_subscribe
+                  -> pr_webapp_registration_signup_click -> pr_webapp_upsell_view
+```
+
+The `*_path` event family identifies the user_path attribute:
+`scale_path`, `escape_path`, `simplify_path`, `starter_path`. The
+attribute is recovered first from `event_metadata` of the
+`pr_funnel_subscribe` event and falls back to the most recent matching
+`pr_funnel_*_path` event for that `device_id` (180-day window).
+
+- **Onboarding Completion Rate** — share of users who fired
+  `pr_funnel_subscribe` after at least one `pr_funnel_*_path` event.
 
 ## Churn
 
-- **Unsub Rate 12h / 24h** — share of users who fired `subscription_cancel` within 12 / 24 hours of `trial_start` or `subscription_start`.
+- **Unsub 12h Rate (on View)** — share of `pr_funnel_subscribe` users
+  who fired `pr_webapp_unsubscribed` within 12 hours of subscribe.
+- **Unsub 12h Rate (on Upsell Purchase)** — same, computed only on
+  users who also fired `pr_webapp_upsell_successful_purchase`.
 
-## Reviews and feedback
+## Negative-effect signals (added in u15.4.0 vs u15.4.5)
 
-- **CSAT score / weight** — sourced from in-app survey events (`event_name = 'csat_submitted'`, `JSON_VALUE(event_metadata, '$.score')`).
-- **iOS App Store review / Trustpilot review** — pulled from external review APIs (not from BigQuery).
+- **Insufficient Funds modal interactions** — flags
+  `has_insufficient_fund_view` / `has_insufficient_fund_click`
+  derived from `pr_webapp_upsell_insufficient_fund_view` /
+  `pr_webapp_upsell_insufficient_fund_click`.
+- **Declined upsell with Insufficient Funds reason** — counted from
+  `payments.all_payments_prod` with `status = 'declined'` and
+  `decline_message LIKE 'Insufficient Funds'`.
+- **Refund-tagged Intercom tickets** — joined by author email through
+  `analytics_draft.intercom_tickets` filtered to
+  `tag_name LIKE '%upsell refund%'`.
+
+## A/B test methodology
+
+For small samples (n=107..200 per group) and heavy-tailed metric
+distributions (`purch_amount` in particular), significance is tested
+with a **non-parametric bootstrap of the difference of means**:
+
+- 10 000 iterations, resampling clean and test groups independently
+  with replacement
+- one-sided 95% confidence interval from percentiles
+- p-value defined as `min(share of diffs ≤ 0, share of diffs ≥ 0)`
+
+For sensitivity analysis (planning the next test), MDE for 80% target
+power is computed numerically with `scipy.optimize.brentq` on top of
+`power_binary` / `power_continuous` using a two-proportion z-test
+approximation.
+
+See [`notebooks/04_ab_test_bootstrap.ipynb`](../notebooks/04_ab_test_bootstrap.ipynb).

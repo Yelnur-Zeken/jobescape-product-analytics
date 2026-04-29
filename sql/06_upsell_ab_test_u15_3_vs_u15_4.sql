@@ -1,0 +1,21 @@
+-- 06_upsell_ab_test_u15_3_vs_u15_4.sql
+-- Pull for the previous test that the bootstrap analysis was run on:
+--   * clean = u15.3.1
+--   * test  = u15.4.1
+--
+-- Same shape as 04_upsell_user_level.sql; the experiment filter is
+--   AND COALESCE(
+--         JSON_VALUE(ups_view.event_metadata, '$.upsell_version'),
+--         REGEXP_EXTRACT(ups_view.referrer, r'[?&]upsell_version=([^&]+)')
+--       ) IN ('u15.3.1', 'u15.4.1')
+--   AND DATE(ups_view.timestamp) >= DATE '2026-04-08'
+--   AND DATE(ups_view.timestamp) <= DATE '2026-04-23'
+--
+-- The output of this query is the input to convert_to_user_level()
+-- inside notebooks/04_ab_test_bootstrap.ipynb. After conversion the
+-- sample size is n_clean = 107, n_test = 190.
+--
+-- Headline result: Upsell Rate (on View) +34.29% (p<0.001),
+-- AOV on Purchasing Users -25.50% (p<0.001).
+-- See notebooks/04_ab_test_bootstrap.ipynb and
+-- docs/ab_test_summary_u15.3.1_u15.4.1.md for the full table.

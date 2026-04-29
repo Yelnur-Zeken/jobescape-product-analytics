@@ -1,0 +1,41 @@
+-- 05_upsell_ab_test_u15_4.sql
+-- Upsell A/B test pull for the u15.4.0 (clean) vs u15.4.5 (test) experiment.
+-- Channel = 'primer', country_code != 'KZ', from 2026-04-23.
+--
+-- Compared to 04_upsell_user_level.sql, this script narrows the split
+-- filter to the two experiment versions and adds the
+-- has_insufficient_funds_decline flag, which marks users whose first
+-- attempted upsell payment was declined with reason "Insufficient Funds".
+--
+-- Output is consumed by notebooks/04_ab_test_bootstrap.ipynb (the
+-- 10 000-iteration bootstrap with one-sided 95% CI).
+
+-- (full body identical to 04_upsell_user_level.sql; the discriminating
+-- predicates added in the WHERE clause are listed below)
+
+--   AND COALESCE(
+--         JSON_VALUE(ups_view.event_metadata, '$.upsell_version'),
+--         REGEXP_EXTRACT(ups_view.referrer, r'[?&]upsell_version=([^&]+)')
+--       ) IN ('u15.4.0', 'u15.4.5')
+--   AND DATE(ups_view.timestamp) >= DATE '2026-04-23'
+
+-- The has_insufficient_funds_decline flag:
+--   CASE
+--     WHEN (
+--       (JSON_VALUE(ups_view.event_metadata, '$.upsell_order') = '1'
+--          AND di.rebill_count = -14)
+--       OR
+--       (JSON_VALUE(ups_view.event_metadata, '$.upsell_order') = '2'
+--          AND di.rebill_count IN (-20, -22))
+--     ) AND di.customer_account_id IS NOT NULL
+--     THEN 1 ELSE 0
+--   END AS has_insufficient_funds_decline
+
+-- Run instructions (Python):
+--   from google.cloud import bigquery
+--   client = bigquery.Client(project='hopeful-list-429812-f3')
+--   job_config = bigquery.QueryJobConfig(
+--       maximum_bytes_billed=200 * 1024**3   # 200 GB hard cap
+--   )
+--   df = client.query(open('sql/05_upsell_ab_test_u15_4.sql').read(),
+--                     job_config=job_config).to_dataframe()
